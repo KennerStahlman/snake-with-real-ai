@@ -125,11 +125,8 @@ def train(render_every, max_games):
         # get move
         final_move = agent.get_action(state_old)
         
-        # Only render every Nth game
-        should_render = agent.n_games % render_every == 0
-        
         # perform move and get new state
-        reward, done, score = game.play_step(final_move, should_render)
+        reward, done, score = game.play_step(final_move)
         state_new = agent.get_state(game)
         print(f"reward: {reward}")
         # train short memory
@@ -189,7 +186,7 @@ def play_with_trained_ai():
         final_move = agent.get_action(state_old)
         
         # perform move and get new state
-        reward, done, score = game.play_step(final_move, True)  # Always render
+        reward, done, score = game.play_step(final_move)  # Always render
         
         if done:
             print('Game Over! Score:', score)
