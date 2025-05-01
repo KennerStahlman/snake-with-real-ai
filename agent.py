@@ -3,28 +3,25 @@ import random
 import numpy as np
 from game import SnakeGameAI, Direction, Point
 from collections import deque
-from model import Linear_QNet, QTrainer, device  # Import device from model.py
+from model import Linear_QNet, QTrainer, device
 from helper import plot
-import pygame
 import os
+from torch.cuda.amp import autocast, GradScaler  # For mixed precision training
 
-# Check if GPU is available
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {device}")
-
-# Memory and Training Parameters
-MAX_MEMORY = 100_000    # Reduced from 200,000
-BATCH_SIZE = 2000       # Reduced from 4,000
-LR = 0.001            # Keep this the same
+# Optimized parameters for A100
+MAX_MEMORY = 1_000_000    # Much larger memory buffer
+BATCH_SIZE = 32_768       # Larger batch size to utilize A100's power
+LR = 0.001
 
 class Agent:
     def __init__(self, epsilon_start=1):
         self.n_games = 0
-        self.epsilon = epsilon_start      # Start with more exploration
-        self.gamma = 0.95      # Higher discount factor for better long-term planning
-        self.memory = deque(maxlen=MAX_MEMORY)  # Experience replay buffer
-        self.model = Linear_QNet(2304, 512, 256, 128, 3).to(device)    # Move model to GPU
+        self.epsilon = epsilon_start
+        self.gamma = 0.95
+        self.memory = deque(maxlen=MAX_MEMORY)
+        self.model = Linear_QNet(2304, 512, 256, 128, 3).to(device)
         self.trainer = QTrainer(self.model, lr=LR, gamma=self.gamma)
+        self.scaler = GradScaler()  # For mixed precision training
         
         # Try to load saved model
         model_path = './model/model.pth'
@@ -42,28 +39,22 @@ class Agent:
         for point in game.snake[1:]:  # Skip head
             grid_x = int(point.x / game.block_size_x)
             grid_y = int(point.y / game.block_size_y)
-            # Ensure coordinates are within bounds
             if 0 <= grid_x < game.grid_width and 0 <= grid_y < game.grid_height:
-                state[grid_x, grid_y, 1] = 1  # [0,1,0] for snake body/danger
+                state[grid_x, grid_y, 1] = 1
         
         # Fill in snake head
         head_x = int(game.head.x / game.block_size_x)
         head_y = int(game.head.y / game.block_size_y)
-        # Ensure coordinates are within bounds
         if 0 <= head_x < game.grid_width and 0 <= head_y < game.grid_height:
-            state[head_x, head_y, 0] = 1  # [1,0,0] for head
+            state[head_x, head_y, 0] = 1
         
         # Fill in food
         food_x = int(game.food.x / game.block_size_x)
         food_y = int(game.food.y / game.block_size_y)
-        # Ensure coordinates are within bounds
         if 0 <= food_x < game.grid_width and 0 <= food_y < game.grid_height:
-            state[food_x, food_y, 2] = 1  # [0,0,1] for food
+            state[food_x, food_y, 2] = 1
         
-        # Flatten the state array
-        state = state.flatten()
-        
-        return state
+        return state.flatten()
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
@@ -75,10 +66,29 @@ class Agent:
             mini_sample = self.memory
 
         states, actions, rewards, next_states, dones = zip(*mini_sample)
-        self.trainer.train_step(states, actions, rewards, next_states, dones)
+        
+        # Convert to tensors and move to GPU
+        states = torch.tensor(np.array(states), dtype=torch.float32).to(device)
+        actions = torch.tensor(np.array(actions), dtype=torch.long).to(device)
+        rewards = torch.tensor(np.array(rewards), dtype=torch.float32).to(device)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(device)
+        dones = torch.tensor(np.array(dones), dtype=torch.bool).to(device)
+        
+        # Use mixed precision training
+        with autocast():
+            self.trainer.train_step(states, actions, rewards, next_states, dones, self.scaler)
             
     def train_short_memory(self, state, action, reward, next_state, done):
-        self.trainer.train_step(state, action, reward, next_state, done)
+        # Convert to tensors and move to GPU
+        state = torch.tensor(np.array(state), dtype=torch.float32).to(device)
+        action = torch.tensor(np.array(action), dtype=torch.long).to(device)
+        reward = torch.tensor(np.array(reward), dtype=torch.float32).to(device)
+        next_state = torch.tensor(np.array(next_state), dtype=torch.float32).to(device)
+        done = torch.tensor(np.array(done), dtype=torch.bool).to(device)
+        
+        # Use mixed precision training
+        with autocast():
+            self.trainer.train_step(state, action, reward, next_state, done, self.scaler)
     
     def get_action(self, state):
         final_move = [0,0,0]
@@ -87,22 +97,16 @@ class Agent:
             move = random.randint(0, 2)
             final_move[move] = 1
         else:
-            # Convert to float32 tensor
+            # Convert to tensor and use mixed precision
             state_tensor = torch.tensor(state, dtype=torch.float32).to(device)
-            state_tensor = state_tensor.flatten()
-            prediction = self.model(state_tensor)
+            with autocast():
+                prediction = self.model(state_tensor)
             move = torch.argmax(prediction).item()
             final_move[move] = 1
 
         return final_move
 
 def train(render_every, max_games):
-    """
-    Train the AI agent
-    Parameters:
-        render_every (int): Render every Nth game. Higher values = faster training
-        max_games (int): Maximum number of games to train for
-    """
     if os.path.exists('./model/model.pth'):
         os.remove('./model/model.pth')
     plot_scores = []
@@ -112,38 +116,26 @@ def train(render_every, max_games):
     agent = Agent()
     game = SnakeGameAI()
     
-    # Calculate target score based on screen size
-    # Each block is 20x20 pixels, so divide screen dimensions by 20
     grid_width = game.w // 20
     grid_height = game.h // 20
-    target_score = grid_width * grid_height  # Maximum possible score (filling entire grid)
+    target_score = grid_width * grid_height
     
     while agent.n_games < max_games:
-        # get old state
         state_old = agent.get_state(game)
-
-        # get move
         final_move = agent.get_action(state_old)
-        
-        # perform move and get new state
         reward, done, score = game.play_step(final_move)
         state_new = agent.get_state(game)
-        print(f"reward: {reward}")
-        # train short memory
+        
         agent.train_short_memory(state_old, final_move, reward, state_new, done)
-
-        # remember
         agent.remember(state_old, final_move, reward, state_new, done)
     
         if done:
-            # train long memory, plot result
-            if agent.n_games < 100:
-                agent.epsilon *= 0.95    # Faster initial exploration decay
-            elif agent.n_games < 500:
-                agent.epsilon *= 0.97
+            if agent.n_games < 300:
+                agent.epsilon *= 0.995
+            elif agent.n_games < 1000:
+                agent.epsilon *= 0.9975
             else:
-                agent.epsilon = max(0.01, agent.epsilon * 0.99)
-
+                agent.epsilon = max(0.001, agent.epsilon * 0.999)
             game.reset()
             agent.n_games += 1
             agent.train_long_memory()
@@ -151,7 +143,6 @@ def train(render_every, max_games):
             if score > record:
                 record = score
 
-            # Save model every 200 games
             if agent.n_games % 200 == 0:
                 agent.model.save()
                 print(f'Saved model at game {agent.n_games}')
@@ -162,9 +153,7 @@ def train(render_every, max_games):
             mean_score = total_score / agent.n_games
             plot_mean_scores.append(mean_score)
             plot(plot_scores, plot_mean_scores)
-            print(agent.epsilon)
             
-            # Early stopping if target score is reached
             if mean_score >= target_score:
                 print(f"Training complete! Reached target score of {target_score} in {agent.n_games} games.")
                 break
@@ -172,31 +161,17 @@ def train(render_every, max_games):
     print(f"Training finished after {agent.n_games} games. Final mean score: {mean_score}")
 
 def play_with_trained_ai():
-    """
-    Run the game with the trained AI model
-    """
-    agent = Agent(epsilon_start=0)  # This will automatically load the saved model
+    agent = Agent(epsilon_start=0)
     game = SnakeGameAI()
     
-    while True:  # Run indefinitely
-        # get old state
+    while True:
         state_old = agent.get_state(game)
-
-        # get move
         final_move = agent.get_action(state_old)
-        
-        # perform move and get new state
-        reward, done, score = game.play_step(final_move)  # Always render
+        reward, done, score = game.play_step(final_move)
         
         if done:
             print('Game Over! Score:', score)
             game.reset()
 
 if __name__ == "__main__":
-    # Uncomment one of these lines:
-    
-    # To train the AI:
-    train(render_every=500, max_games=3000)  # Only render every 500th game
-    
-    # To play with the trained AI:
-    # play_with_trained_ai()
+    train(render_every=500, max_games=3000)

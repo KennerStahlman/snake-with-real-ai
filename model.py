@@ -14,6 +14,15 @@ class Linear_QNet(nn.Module):
         self.linear2 = nn.Linear(hidden_size1, hidden_size2)
         self.linear3 = nn.Linear(hidden_size2, hidden_size3)
         self.linear4 = nn.Linear(hidden_size3, output_size)
+        
+        # Initialize weights for better training
+        nn.init.kaiming_normal_(self.linear1.weight)
+        nn.init.kaiming_normal_(self.linear2.weight)
+        nn.init.kaiming_normal_(self.linear3.weight)
+        nn.init.kaiming_normal_(self.linear4.weight)
+        
+        # Move model to GPU
+        self.to(device)
 
     def forward(self, x):
         x = F.relu(self.linear1(x))
@@ -36,39 +45,47 @@ class QTrainer:
         self.lr = lr
         self.gamma = gamma
         self.model = model
-        self.optimizer = optim.Adam(model.parameters(), lr=self.lr)
+        self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self.criterion = nn.MSELoss()
 
-    def train_step(self, state, action, reward, next_state, done):
-        state = torch.tensor(state, dtype=torch.float).to(device)
-        next_state = torch.tensor(next_state, dtype=torch.float).to(device)
+    def train_step(self, state, action, reward, next_state, done, scaler):
+        # Convert to tensors if they aren't already
+        state = torch.tensor(state, dtype=torch.float32).to(device)
+        next_state = torch.tensor(next_state, dtype=torch.float32).to(device)
         action = torch.tensor(action, dtype=torch.long).to(device)
-        reward = torch.tensor(reward, dtype=torch.float).to(device)
-        # (n, x)
+        reward = torch.tensor(reward, dtype=torch.float32).to(device)
+        done = torch.tensor(done, dtype=torch.bool).to(device)
 
+        # If we have a single sample, add a batch dimension
         if len(state.shape) == 1:
-            # (1, x)
             state = torch.unsqueeze(state, 0)
             next_state = torch.unsqueeze(next_state, 0)
             action = torch.unsqueeze(action, 0)
             reward = torch.unsqueeze(reward, 0)
-            done = (done, )
+            done = torch.unsqueeze(done, 0)
+
+        # Get current Q values
+        with torch.cuda.amp.autocast():
+            pred = self.model(state)
+            target = pred.clone()
+            
+            # Get next Q values
+            next_pred = self.model(next_state)
+            max_next_pred = torch.max(next_pred, dim=1)[0]
+            
+            # Update Q values
+            for idx in range(len(done)):
+                Q_new = reward[idx]
+                if not done[idx]:
+                    Q_new = reward[idx] + self.gamma * max_next_pred[idx]
+                target[idx][torch.argmax(action[idx]).item()] = Q_new
+
+            # Compute loss and update
+            loss = self.criterion(target, pred)
         
-        # 1: predicted Q values with current state
-        pred = self.model(state)
-
-        target = pred.clone()
-        for idx in range(len(done)):
-            Q_new = reward[idx]
-            if not done[idx]:
-                Q_new = reward[idx] + self.gamma * torch.max(self.model(next_state[idx]))
-
-            target[idx][torch.argmax(action[idx]).item()] = Q_new
-
-        # 2: Q_new = r + y * max(next_predicted Q value) --> only do this if not done
+        # Backward pass with mixed precision
         self.optimizer.zero_grad()
-        loss = self.criterion(target, pred)
-        loss.backward()
-
-        self.optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(self.optimizer)
+        scaler.update()
 
